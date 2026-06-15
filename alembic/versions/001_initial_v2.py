@@ -125,11 +125,19 @@ def upgrade() -> None:
     op.create_index("ix_approval_rule_versions_id", "approval_rule_versions", ["id"])
 
 
+IRREVERSIBLE_WARNING = """
+╔═══════════════════════════════════════════════════════════════╗
+║  ⚠️  WARNING: THIS MIGRATION IS IRREVERSIBLE ⚠️               ║
+║                                                               ║
+║  This is the initial schema creation migration. Downgrading   ║
+║  will DROP ALL TABLES and PERMANENTLY DELETE ALL DATA.        ║
+║                                                               ║
+║  DO NOT run downgrade in production under any circumstances.  ║
+║  If you absolutely must proceed, ensure you have a full       ║
+║  verified backup of all data before continuing.               ║
+╚═══════════════════════════════════════════════════════════════╝
+"""
+
+
 def downgrade() -> None:
-    op.drop_table("approval_records")
-    op.drop_table("approval_node_approvers")
-    op.drop_table("approval_nodes")
-    op.drop_table("purchase_items")
-    op.drop_table("purchase_orders")
-    op.drop_table("approval_rules")
-    op.drop_table("approval_rule_versions")
+    raise RuntimeError(IRREVERSIBLE_WARNING)

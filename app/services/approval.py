@@ -25,6 +25,17 @@ DEFAULT_RULES = [
     {"level": ApprovalLevel.CEO, "min_amount": 200000, "max_amount": None},
 ]
 
+ABSENT_APPROVER_TIMEOUT_HOURS = 24
+
+LEVEL_ORDER = {
+    ApprovalLevel.MANAGER: 0,
+    ApprovalLevel.DIRECTOR: 1,
+    ApprovalLevel.VP: 2,
+    ApprovalLevel.CEO: 3,
+}
+
+APPROVER_ABSENT_THRESHOLD_MINUTES = 30
+
 LEVEL_NAMES = {
     ApprovalLevel.MANAGER: "经理",
     ApprovalLevel.DIRECTOR: "总监",
@@ -41,6 +52,7 @@ def init_default_rule_version(db: Session) -> ApprovalRuleVersion:
     version = ApprovalRuleVersion(
         version_number=1,
         is_active=True,
+        min_skip_amount=50000,
         description="默认审批规则",
     )
     db.add(version)
@@ -143,16 +155,49 @@ def create_approval_nodes(db: Session, order: PurchaseOrder) -> list[ApprovalNod
     return nodes
 
 
-def _get_current_node(db: Session, order: PurchaseOrder) -> ApprovalNode | None:
+def _get_current_node(db: Session, order: PurchaseOrder, lock: bool = False) -> ApprovalNode | None:
     if order.current_node_id is None:
         return None
     from sqlalchemy.orm import selectinload
-    return (
+    query = (
         db.query(ApprovalNode)
         .options(selectinload(ApprovalNode.approvers))
         .filter(ApprovalNode.id == order.current_node_id)
+    )
+    if lock:
+        query = query.with_for_update()
+    return query.first()
+
+
+def _check_idempotency_key(
+    db: Session, idempotency_key: str | None, order_id: int,
+) -> ApprovalRecord | None:
+    if not idempotency_key:
+        return None
+    return (
+        db.query(ApprovalRecord)
+        .filter(ApprovalRecord.idempotency_key == idempotency_key)
+        .filter(ApprovalRecord.order_id == order_id)
         .first()
     )
+
+
+def _create_audit_record(
+    db: Session, order: PurchaseOrder, node: ApprovalNode | None,
+    approver: str, action_type: ApprovalActionType, comment: str | None,
+    idempotency_key: str | None = None,
+) -> ApprovalRecord:
+    record = ApprovalRecord(
+        order_id=order.id,
+        node_id=node.id if node else None,
+        approver=approver,
+        action_type=action_type,
+        idempotency_key=idempotency_key,
+        comment=comment,
+    )
+    db.add(record)
+    db.flush()
+    return record
 
 
 def _get_order_nodes(db: Session, order: PurchaseOrder) -> list[ApprovalNode]:
@@ -186,30 +231,102 @@ def _advance_to_next_node(db: Session, order: PurchaseOrder, current_node: Appro
         order.current_node_id = next_node.id
 
 
-def _create_audit_record(
-    db: Session, order: PurchaseOrder, node: ApprovalNode | None,
-    approver: str, action_type: ApprovalActionType, comment: str | None,
-) -> ApprovalRecord:
-    record = ApprovalRecord(
-        order_id=order.id,
-        node_id=node.id if node else None,
-        approver=approver,
-        action_type=action_type,
-        comment=comment,
+def _handle_absent_approver(
+    db: Session, node: ApprovalNode, approver: ApprovalNodeApprover,
+) -> None:
+    if not approver.backup_approver:
+        return
+
+    backup = ApprovalNodeApprover(
+        node_id=node.id,
+        approver=approver.backup_approver,
+        acted=False,
+        is_absent=False,
+        backup_approver=None,
     )
-    db.add(record)
+    db.add(backup)
+    approver.is_absent = True
     db.flush()
-    return record
+
+
+def _check_skip_threshold(db: Session, order: PurchaseOrder) -> None:
+    version = get_active_rule_version(db)
+    if not version:
+        return
+
+    if order.total_amount < version.min_skip_amount:
+        raise ValueError(
+            f"跳级审批仅适用于金额大于等于 ¥{version.min_skip_amount:,.2f} 的采购单，"
+            f"当前金额为 ¥{order.total_amount:,.2f}"
+        )
+
+    nodes = _get_order_nodes(db, order)
+    current_idx = None
+    for i, n in enumerate(nodes):
+        if n.id == order.current_node_id:
+            current_idx = i
+            break
+
+    if current_idx is not None:
+        remaining = len(nodes) - current_idx - 1
+        if remaining < 1:
+            raise ValueError("当前已是最后一级审批，无法跳级")
+
+
+def _cleanup_pending_orders_on_rollback(db: Session, old_version_id: int) -> list[int]:
+    pending_orders = (
+        db.query(PurchaseOrder)
+        .filter(PurchaseOrder.rule_version_id == old_version_id)
+        .filter(PurchaseOrder.status == PurchaseStatus.PENDING)
+        .all()
+    )
+
+    affected_order_ids = []
+    for order in pending_orders:
+        db.query(ApprovalNodeApprover).filter(
+            ApprovalNodeApprover.node_id.in_(
+                db.query(ApprovalNode.id).filter(ApprovalNode.order_id == order.id)
+            )
+        ).delete(synchronize_session=False)
+
+        db.query(ApprovalNode).filter(
+            ApprovalNode.order_id == order.id
+        ).delete(synchronize_session=False)
+
+        order.rule_version_id = None
+        order.current_node_id = None
+        order.status = PurchaseStatus.DRAFT
+        affected_order_ids.append(order.id)
+
+    db.flush()
+    return affected_order_ids
 
 
 def process_approve(
     db: Session, order: PurchaseOrder, approver: str, comment: str | None,
+    idempotency_key: str | None = None,
 ) -> PurchaseOrder:
-    node = _get_current_node(db, order)
+    existing = _check_idempotency_key(db, idempotency_key, order.id)
+    if existing:
+        return order
+
+    node = _get_current_node(db, order, lock=True)
     if not node:
         raise ValueError("采购单当前无待审批节点")
 
-    _create_audit_record(db, order, node, approver, ApprovalActionType.APPROVE, comment)
+    approver_entry = None
+    if node.mode == ApprovalNodeMode.COUNTERSIGN:
+        approver_entry = db.query(ApprovalNodeApprover).filter(
+            ApprovalNodeApprover.node_id == node.id,
+            ApprovalNodeApprover.approver == approver,
+        ).first()
+        if approver_entry and approver_entry.is_absent:
+            _handle_absent_approver(db, node, approver_entry)
+            approver = approver_entry.backup_approver
+
+    _create_audit_record(
+        db, order, node, approver, ApprovalActionType.APPROVE, comment, idempotency_key,
+    )
 
     if node.mode == ApprovalNodeMode.SEQUENTIAL:
         _mark_approver(db, node, approver, ApprovalActionType.APPROVE, comment)
@@ -222,6 +339,7 @@ def process_approve(
         pending = db.query(ApprovalNodeApprover).filter(
             ApprovalNodeApprover.node_id == node.id,
             ApprovalNodeApprover.acted == False,
+            ApprovalNodeApprover.is_absent == False,
         ).count()
         if pending == 0:
             node.status = ApprovalNodeStatus.APPROVED
@@ -239,12 +357,19 @@ def process_approve(
 
 def process_reject(
     db: Session, order: PurchaseOrder, approver: str, comment: str | None,
+    idempotency_key: str | None = None,
 ) -> PurchaseOrder:
-    node = _get_current_node(db, order)
+    existing = _check_idempotency_key(db, idempotency_key, order.id)
+    if existing:
+        return order
+
+    node = _get_current_node(db, order, lock=True)
     if not node:
         raise ValueError("采购单当前无待审批节点")
 
-    _create_audit_record(db, order, node, approver, ApprovalActionType.REJECT, comment)
+    _create_audit_record(
+        db, order, node, approver, ApprovalActionType.REJECT, comment, idempotency_key,
+    )
     _mark_approver(db, node, approver, ApprovalActionType.REJECT, comment)
 
     node.status = ApprovalNodeStatus.REJECTED
@@ -259,12 +384,19 @@ def process_reject(
 def process_countersign(
     db: Session, order: PurchaseOrder, initiator: str,
     approvers: list[str], comment: str | None,
+    idempotency_key: str | None = None,
 ) -> PurchaseOrder:
-    node = _get_current_node(db, order)
+    existing = _check_idempotency_key(db, idempotency_key, order.id)
+    if existing:
+        return order
+
+    node = _get_current_node(db, order, lock=True)
     if not node:
         raise ValueError("采购单当前无待审批节点")
 
-    _create_audit_record(db, order, node, initiator, ApprovalActionType.COUNTERSIGN, comment)
+    _create_audit_record(
+        db, order, node, initiator, ApprovalActionType.COUNTERSIGN, comment, idempotency_key,
+    )
 
     node.mode = ApprovalNodeMode.COUNTERSIGN
 
@@ -280,6 +412,8 @@ def process_countersign(
                 node_id=node.id,
                 approver=name,
                 acted=is_acted,
+                is_absent=False,
+                backup_approver=None,
                 action_type=ApprovalActionType.COUNTERSIGN if is_acted else None,
                 comment=comment if is_acted else None,
                 acted_at=datetime.utcnow() if is_acted else None,
@@ -301,6 +435,7 @@ def process_countersign(
     pending = db.query(ApprovalNodeApprover).filter(
         ApprovalNodeApprover.node_id == node.id,
         ApprovalNodeApprover.acted == False,
+        ApprovalNodeApprover.is_absent == False,
     ).count()
     if pending == 0:
         node.status = ApprovalNodeStatus.APPROVED
@@ -314,12 +449,20 @@ def process_countersign(
 def process_add_sign(
     db: Session, order: PurchaseOrder, approver: str,
     added_approver: str, comment: str | None,
+    backup_approver: str | None = None,
+    idempotency_key: str | None = None,
 ) -> PurchaseOrder:
-    node = _get_current_node(db, order)
+    existing = _check_idempotency_key(db, idempotency_key, order.id)
+    if existing:
+        return order
+
+    node = _get_current_node(db, order, lock=True)
     if not node:
         raise ValueError("采购单当前无待审批节点")
 
-    _create_audit_record(db, order, node, approver, ApprovalActionType.ADD_SIGN, comment)
+    _create_audit_record(
+        db, order, node, approver, ApprovalActionType.ADD_SIGN, comment, idempotency_key,
+    )
 
     existing = db.query(ApprovalNodeApprover).filter(
         ApprovalNodeApprover.node_id == node.id,
@@ -330,12 +473,16 @@ def process_add_sign(
             node_id=node.id,
             approver=approver,
             acted=False,
+            is_absent=False,
+            backup_approver=None,
         ))
 
     db.add(ApprovalNodeApprover(
         node_id=node.id,
         approver=added_approver,
         acted=False,
+        is_absent=False,
+        backup_approver=backup_approver,
     ))
 
     node.mode = ApprovalNodeMode.COUNTERSIGN
@@ -348,12 +495,19 @@ def process_add_sign(
 def process_parallel_sign(
     db: Session, order: PurchaseOrder, initiator: str,
     approvers: list[str], comment: str | None,
+    idempotency_key: str | None = None,
 ) -> PurchaseOrder:
-    node = _get_current_node(db, order)
+    existing = _check_idempotency_key(db, idempotency_key, order.id)
+    if existing:
+        return order
+
+    node = _get_current_node(db, order, lock=True)
     if not node:
         raise ValueError("采购单当前无待审批节点")
 
-    _create_audit_record(db, order, node, initiator, ApprovalActionType.PARALLEL_SIGN, comment)
+    _create_audit_record(
+        db, order, node, initiator, ApprovalActionType.PARALLEL_SIGN, comment, idempotency_key,
+    )
 
     node.mode = ApprovalNodeMode.PARALLEL
 
@@ -362,6 +516,8 @@ def process_parallel_sign(
             node_id=node.id,
             approver=name,
             acted=False,
+            is_absent=False,
+            backup_approver=None,
         ))
 
     db.commit()
@@ -371,12 +527,21 @@ def process_parallel_sign(
 
 def process_skip(
     db: Session, order: PurchaseOrder, approver: str, comment: str | None,
+    idempotency_key: str | None = None,
 ) -> PurchaseOrder:
-    node = _get_current_node(db, order)
+    existing = _check_idempotency_key(db, idempotency_key, order.id)
+    if existing:
+        return order
+
+    _check_skip_threshold(db, order)
+
+    node = _get_current_node(db, order, lock=True)
     if not node:
         raise ValueError("采购单当前无待审批节点")
 
-    _create_audit_record(db, order, node, approver, ApprovalActionType.SKIP, comment)
+    _create_audit_record(
+        db, order, node, approver, ApprovalActionType.SKIP, comment, idempotency_key,
+    )
 
     node.status = ApprovalNodeStatus.SKIPPED
     _advance_to_next_node(db, order, node)
@@ -388,12 +553,19 @@ def process_skip(
 
 def process_return(
     db: Session, order: PurchaseOrder, approver: str, comment: str | None,
+    idempotency_key: str | None = None,
 ) -> PurchaseOrder:
-    node = _get_current_node(db, order)
+    existing = _check_idempotency_key(db, idempotency_key, order.id)
+    if existing:
+        return order
+
+    node = _get_current_node(db, order, lock=True)
     if not node:
         raise ValueError("采购单当前无待审批节点")
 
-    _create_audit_record(db, order, node, approver, ApprovalActionType.RETURN, comment)
+    _create_audit_record(
+        db, order, node, approver, ApprovalActionType.RETURN, comment, idempotency_key,
+    )
 
     nodes = _get_order_nodes(db, order)
     prev_node = None
@@ -420,11 +592,18 @@ def process_return(
 
 def process_withdraw(
     db: Session, order: PurchaseOrder, applicant: str, comment: str | None,
+    idempotency_key: str | None = None,
 ) -> PurchaseOrder:
+    existing = _check_idempotency_key(db, idempotency_key, order.id)
+    if existing:
+        return order
+
     if order.applicant != applicant:
         raise ValueError("仅申请人可撤回采购单")
 
-    _create_audit_record(db, order, None, applicant, ApprovalActionType.WITHDRAW, comment)
+    _create_audit_record(
+        db, order, None, applicant, ApprovalActionType.WITHDRAW, comment, idempotency_key,
+    )
 
     db.query(ApprovalNodeApprover).filter(
         ApprovalNodeApprover.node_id.in_(
@@ -481,6 +660,7 @@ def create_rule_version(db: Session, data: RuleVersionCreate) -> ApprovalRuleVer
     version = ApprovalRuleVersion(
         version_number=next_version,
         is_active=True,
+        min_skip_amount=data.min_skip_amount,
         description=data.description,
     )
     db.add(version)
@@ -526,5 +706,16 @@ def deactivate_rule_version(db: Session, version_id: int) -> ApprovalRuleVersion
     return version
 
 
-def rollback_rule_version(db: Session, version_id: int) -> ApprovalRuleVersion:
-    return activate_rule_version(db, version_id)
+def rollback_rule_version(db: Session, version_id: int) -> tuple[ApprovalRuleVersion, list[int]]:
+    current_active = get_active_rule_version(db)
+    old_version_id = current_active.id if current_active else None
+
+    version = activate_rule_version(db, version_id)
+
+    affected_order_ids = []
+    if old_version_id:
+        affected_order_ids = _cleanup_pending_orders_on_rollback(db, old_version_id)
+
+    db.commit()
+    db.refresh(version)
+    return version, affected_order_ids

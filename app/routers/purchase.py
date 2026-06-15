@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.exc import IntegrityError
 
 from app.database import get_db
 from app.models import (
@@ -12,7 +13,7 @@ from app.schemas import (
     CountersignRequest, AddSignRequest, ParallelSignRequest,
     SkipRequest, ReturnRequest, WithdrawRequest,
     RuleVersionCreate, RuleVersionOut, RuleVersionSummary, ApprovalRuleOut,
-    MessageOut,
+    MessageOut, RollbackResult,
 )
 from app.services.approval import (
     init_default_rule_version, get_approval_route,
@@ -21,9 +22,35 @@ from app.services.approval import (
     process_skip, process_return, process_withdraw,
     create_rule_version, activate_rule_version, deactivate_rule_version,
     rollback_rule_version, get_active_rule_version,
+    _check_idempotency_key,
 )
 
 router = APIRouter(prefix="/api/purchase-orders", tags=["采购单"])
+
+
+def _precheck_idempotency(
+    db: Session, order_id: int, idempotency_key: str | None,
+) -> PurchaseOrder | None:
+    if not idempotency_key:
+        return None
+
+    existing_record = _check_idempotency_key(db, idempotency_key, order_id)
+    if existing_record:
+        return _load_order(db, order_id)
+    return None
+
+
+def _handle_approval_exception(e: Exception) -> None:
+    if isinstance(e, ValueError):
+        raise HTTPException(status_code=400, detail=str(e))
+    if isinstance(e, IntegrityError):
+        if "idempotency_key" in str(e):
+            raise HTTPException(
+                status_code=409,
+                detail="幂等键已被其他请求使用，请使用唯一的幂等键"
+            )
+        raise HTTPException(status_code=400, detail="数据完整性错误")
+    raise
 
 
 @router.post("/", response_model=PurchaseOrderOut, status_code=201)
@@ -81,6 +108,10 @@ def submit_purchase_order(order_id: int, db: Session = Depends(get_db)):
 
 @router.post("/{order_id}/approve", response_model=PurchaseOrderOut)
 def approve_purchase_order(order_id: int, data: ApprovalRequest, db: Session = Depends(get_db)):
+    existing = _precheck_idempotency(db, order_id, data.idempotency_key)
+    if existing:
+        return existing
+
     order = _load_order(db, order_id)
     if not order:
         raise HTTPException(status_code=404, detail="采购单不存在")
@@ -89,17 +120,27 @@ def approve_purchase_order(order_id: int, data: ApprovalRequest, db: Session = D
 
     try:
         if data.action == ApprovalActionType.REJECT:
-            order = process_reject(db, order, data.approver, data.comment)
+            order = process_reject(
+                db, order, data.approver, data.comment,
+                idempotency_key=data.idempotency_key,
+            )
         else:
-            order = process_approve(db, order, data.approver, data.comment)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+            order = process_approve(
+                db, order, data.approver, data.comment,
+                idempotency_key=data.idempotency_key,
+            )
+    except Exception as e:
+        _handle_approval_exception(e)
 
     return _load_order(db, order.id)
 
 
 @router.post("/{order_id}/countersign", response_model=PurchaseOrderOut)
 def countersign_purchase_order(order_id: int, data: CountersignRequest, db: Session = Depends(get_db)):
+    existing = _precheck_idempotency(db, order_id, data.idempotency_key)
+    if existing:
+        return existing
+
     order = _load_order(db, order_id)
     if not order:
         raise HTTPException(status_code=404, detail="采购单不存在")
@@ -107,15 +148,22 @@ def countersign_purchase_order(order_id: int, data: CountersignRequest, db: Sess
         raise HTTPException(status_code=400, detail="仅待审批状态可发起会签")
 
     try:
-        order = process_countersign(db, order, data.initiator, data.approvers, data.comment)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        order = process_countersign(
+            db, order, data.initiator, data.approvers, data.comment,
+            idempotency_key=data.idempotency_key,
+        )
+    except Exception as e:
+        _handle_approval_exception(e)
 
     return _load_order(db, order.id)
 
 
 @router.post("/{order_id}/add-sign", response_model=PurchaseOrderOut)
 def add_sign_purchase_order(order_id: int, data: AddSignRequest, db: Session = Depends(get_db)):
+    existing = _precheck_idempotency(db, order_id, data.idempotency_key)
+    if existing:
+        return existing
+
     order = _load_order(db, order_id)
     if not order:
         raise HTTPException(status_code=404, detail="采购单不存在")
@@ -123,15 +171,23 @@ def add_sign_purchase_order(order_id: int, data: AddSignRequest, db: Session = D
         raise HTTPException(status_code=400, detail="仅待审批状态可加签")
 
     try:
-        order = process_add_sign(db, order, data.approver, data.added_approver, data.comment)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        order = process_add_sign(
+            db, order, data.approver, data.added_approver, data.comment,
+            backup_approver=data.backup_approver,
+            idempotency_key=data.idempotency_key,
+        )
+    except Exception as e:
+        _handle_approval_exception(e)
 
     return _load_order(db, order.id)
 
 
 @router.post("/{order_id}/parallel-sign", response_model=PurchaseOrderOut)
 def parallel_sign_purchase_order(order_id: int, data: ParallelSignRequest, db: Session = Depends(get_db)):
+    existing = _precheck_idempotency(db, order_id, data.idempotency_key)
+    if existing:
+        return existing
+
     order = _load_order(db, order_id)
     if not order:
         raise HTTPException(status_code=404, detail="采购单不存在")
@@ -139,15 +195,22 @@ def parallel_sign_purchase_order(order_id: int, data: ParallelSignRequest, db: S
         raise HTTPException(status_code=400, detail="仅待审批状态可并签")
 
     try:
-        order = process_parallel_sign(db, order, data.initiator, data.approvers, data.comment)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        order = process_parallel_sign(
+            db, order, data.initiator, data.approvers, data.comment,
+            idempotency_key=data.idempotency_key,
+        )
+    except Exception as e:
+        _handle_approval_exception(e)
 
     return _load_order(db, order.id)
 
 
 @router.post("/{order_id}/skip", response_model=PurchaseOrderOut)
 def skip_purchase_order(order_id: int, data: SkipRequest, db: Session = Depends(get_db)):
+    existing = _precheck_idempotency(db, order_id, data.idempotency_key)
+    if existing:
+        return existing
+
     order = _load_order(db, order_id)
     if not order:
         raise HTTPException(status_code=404, detail="采购单不存在")
@@ -155,15 +218,22 @@ def skip_purchase_order(order_id: int, data: SkipRequest, db: Session = Depends(
         raise HTTPException(status_code=400, detail="仅待审批状态可跳级")
 
     try:
-        order = process_skip(db, order, data.approver, data.comment)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        order = process_skip(
+            db, order, data.approver, data.comment,
+            idempotency_key=data.idempotency_key,
+        )
+    except Exception as e:
+        _handle_approval_exception(e)
 
     return _load_order(db, order.id)
 
 
 @router.post("/{order_id}/return", response_model=PurchaseOrderOut)
 def return_purchase_order(order_id: int, data: ReturnRequest, db: Session = Depends(get_db)):
+    existing = _precheck_idempotency(db, order_id, data.idempotency_key)
+    if existing:
+        return existing
+
     order = _load_order(db, order_id)
     if not order:
         raise HTTPException(status_code=404, detail="采购单不存在")
@@ -171,15 +241,22 @@ def return_purchase_order(order_id: int, data: ReturnRequest, db: Session = Depe
         raise HTTPException(status_code=400, detail="仅待审批状态可退回")
 
     try:
-        order = process_return(db, order, data.approver, data.comment)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        order = process_return(
+            db, order, data.approver, data.comment,
+            idempotency_key=data.idempotency_key,
+        )
+    except Exception as e:
+        _handle_approval_exception(e)
 
     return _load_order(db, order.id)
 
 
 @router.post("/{order_id}/withdraw", response_model=PurchaseOrderOut)
 def withdraw_purchase_order(order_id: int, data: WithdrawRequest, db: Session = Depends(get_db)):
+    existing = _precheck_idempotency(db, order_id, data.idempotency_key)
+    if existing:
+        return existing
+
     order = _load_order(db, order_id)
     if not order:
         raise HTTPException(status_code=404, detail="采购单不存在")
@@ -187,9 +264,12 @@ def withdraw_purchase_order(order_id: int, data: WithdrawRequest, db: Session = 
         raise HTTPException(status_code=400, detail="仅待审批状态可撤回")
 
     try:
-        order = process_withdraw(db, order, data.applicant, data.comment)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        order = process_withdraw(
+            db, order, data.applicant, data.comment,
+            idempotency_key=data.idempotency_key,
+        )
+    except Exception as e:
+        _handle_approval_exception(e)
 
     return _load_order(db, order.id)
 
@@ -345,9 +425,16 @@ def deactivate_version(version_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail=str(e))
 
 
-@rule_router.post("/versions/{version_id}/rollback", response_model=RuleVersionOut)
+@rule_router.post("/versions/{version_id}/rollback", response_model=RollbackResult)
 def rollback_version(version_id: int, db: Session = Depends(get_db)):
     try:
-        return rollback_rule_version(db, version_id)
+        version, affected_order_ids = rollback_rule_version(db, version_id)
+        return RollbackResult(
+            version=version,
+            affected_pending_orders=affected_order_ids,
+            message=f"已回滚到版本 {version.version_number}，"
+                    f"{len(affected_order_ids)} 个进行中的采购单已重置为草稿"
+                    if affected_order_ids else f"已回滚到版本 {version.version_number}，无进行中的采购单受影响",
+        )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))

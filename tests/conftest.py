@@ -38,6 +38,15 @@ def client():
 
 
 @pytest.fixture
+def db_session():
+    db = TestSessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+@pytest.fixture
 def sample_order_payload():
     return {
         "title": "办公设备采购",

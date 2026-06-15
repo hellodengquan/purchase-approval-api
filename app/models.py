@@ -59,7 +59,7 @@ class PurchaseOrder(Base):
     department = Column(String(100), nullable=True)
     status = Column(Enum(PurchaseStatus), default=PurchaseStatus.DRAFT, nullable=False)
     idempotency_key = Column(String(128), nullable=True, unique=True)
-    current_node_id = Column(Integer, ForeignKey("approval_nodes.id"), nullable=True)
+    current_node_id = Column(Integer, ForeignKey("approval_nodes.id", use_alter=True), nullable=True)
     rule_version_id = Column(Integer, ForeignKey("approval_rule_versions.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -107,6 +107,8 @@ class ApprovalNodeApprover(Base):
     node_id = Column(Integer, ForeignKey("approval_nodes.id"), nullable=False)
     approver = Column(String(100), nullable=False)
     acted = Column(Boolean, default=False, nullable=False)
+    is_absent = Column(Boolean, default=False, nullable=False)
+    backup_approver = Column(String(100), nullable=True)
     action_type = Column(Enum(ApprovalActionType), nullable=True)
     comment = Column(Text, nullable=True)
     acted_at = Column(DateTime, nullable=True)
@@ -122,6 +124,7 @@ class ApprovalRecord(Base):
     node_id = Column(Integer, ForeignKey("approval_nodes.id", ondelete="SET NULL"), nullable=True)
     approver = Column(String(100), nullable=False)
     action_type = Column(Enum(ApprovalActionType), nullable=False)
+    idempotency_key = Column(String(128), nullable=True, unique=True)
     comment = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -135,6 +138,7 @@ class ApprovalRuleVersion(Base):
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     version_number = Column(Integer, nullable=False, unique=True)
     is_active = Column(Boolean, default=True, nullable=False)
+    min_skip_amount = Column(Float, default=50000, nullable=False)
     description = Column(String(500), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 

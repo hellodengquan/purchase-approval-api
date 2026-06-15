@@ -44,6 +44,8 @@ class ApprovalNodeApproverOut(BaseModel):
     node_id: int
     approver: str
     acted: bool
+    is_absent: bool
+    backup_approver: Optional[str]
     action_type: Optional[ApprovalActionType]
     comment: Optional[str]
     acted_at: Optional[datetime]
@@ -71,6 +73,7 @@ class ApprovalRecordOut(BaseModel):
     node_id: Optional[int]
     approver: str
     action_type: ApprovalActionType
+    idempotency_key: Optional[str]
     comment: Optional[str]
     created_at: datetime
 
@@ -118,39 +121,47 @@ class ApprovalRequest(BaseModel):
     approver: str = Field(..., max_length=100)
     action: ApprovalActionType = ApprovalActionType.APPROVE
     comment: Optional[str] = None
+    idempotency_key: Optional[str] = Field(None, max_length=128)
 
 
 class CountersignRequest(BaseModel):
     initiator: str = Field(..., max_length=100)
     approvers: list[str] = Field(..., min_length=2)
     comment: Optional[str] = None
+    idempotency_key: Optional[str] = Field(None, max_length=128)
 
 
 class AddSignRequest(BaseModel):
     approver: str = Field(..., max_length=100)
     added_approver: str = Field(..., max_length=100)
+    backup_approver: Optional[str] = Field(None, max_length=100)
     comment: Optional[str] = None
+    idempotency_key: Optional[str] = Field(None, max_length=128)
 
 
 class ParallelSignRequest(BaseModel):
     initiator: str = Field(..., max_length=100)
     approvers: list[str] = Field(..., min_length=2)
     comment: Optional[str] = None
+    idempotency_key: Optional[str] = Field(None, max_length=128)
 
 
 class SkipRequest(BaseModel):
     approver: str = Field(..., max_length=100)
     comment: Optional[str] = None
+    idempotency_key: Optional[str] = Field(None, max_length=128)
 
 
 class ReturnRequest(BaseModel):
     approver: str = Field(..., max_length=100)
     comment: Optional[str] = None
+    idempotency_key: Optional[str] = Field(None, max_length=128)
 
 
 class WithdrawRequest(BaseModel):
     applicant: str = Field(..., max_length=100)
     comment: Optional[str] = None
+    idempotency_key: Optional[str] = Field(None, max_length=128)
 
 
 class ApprovalRouteOut(BaseModel):
@@ -175,6 +186,7 @@ class ApprovalRuleOut(ApprovalRuleCreate):
 
 class RuleVersionCreate(BaseModel):
     description: Optional[str] = Field(None, max_length=500)
+    min_skip_amount: float = Field(50000, ge=0)
     rules: list[ApprovalRuleCreate] = Field(..., min_length=1)
 
 
@@ -182,6 +194,7 @@ class RuleVersionOut(BaseModel):
     id: int
     version_number: int
     is_active: bool
+    min_skip_amount: float
     description: Optional[str]
     rules: list[ApprovalRuleOut]
     created_at: datetime
@@ -193,6 +206,7 @@ class RuleVersionSummary(BaseModel):
     id: int
     version_number: int
     is_active: bool
+    min_skip_amount: float
     description: Optional[str]
     created_at: datetime
 
@@ -202,3 +216,9 @@ class RuleVersionSummary(BaseModel):
 class MessageOut(BaseModel):
     message: str
     detail: Optional[str] = None
+
+
+class RollbackResult(BaseModel):
+    version: RuleVersionOut
+    affected_pending_orders: list[int]
+    message: str
