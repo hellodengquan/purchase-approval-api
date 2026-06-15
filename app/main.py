@@ -14,8 +14,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="采购审批管理系统 API",
-    description="实现采购单的申请提交、多级审批流程，并设置金额阈值路由",
-    version="1.0.0",
+    description="实现采购单的申请提交、多级审批流程（含会签/加签/并签/跳级/退回/撤回），金额阈值路由，审批规则版本管理",
+    version="2.0.0",
     lifespan=lifespan,
 )
 

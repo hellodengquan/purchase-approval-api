@@ -3,7 +3,10 @@ from typing import Optional
 
 from pydantic import BaseModel, Field
 
-from app.models import PurchaseStatus, ApprovalAction, ApprovalLevel
+from app.models import (
+    PurchaseStatus, ApprovalActionType, ApprovalLevel,
+    ApprovalNodeMode, ApprovalNodeStatus,
+)
 
 
 class PurchaseItemCreate(BaseModel):
@@ -26,6 +29,7 @@ class PurchaseOrderCreate(BaseModel):
     applicant: str = Field(..., max_length=100)
     department: Optional[str] = Field(None, max_length=100)
     items: list[PurchaseItemCreate] = Field(..., min_length=1)
+    idempotency_key: Optional[str] = Field(None, max_length=128)
 
 
 class PurchaseOrderUpdate(BaseModel):
@@ -33,6 +37,44 @@ class PurchaseOrderUpdate(BaseModel):
     description: Optional[str] = None
     department: Optional[str] = Field(None, max_length=100)
     items: Optional[list[PurchaseItemCreate]] = None
+
+
+class ApprovalNodeApproverOut(BaseModel):
+    id: int
+    node_id: int
+    approver: str
+    acted: bool
+    action_type: Optional[ApprovalActionType]
+    comment: Optional[str]
+    acted_at: Optional[datetime]
+
+    model_config = {"from_attributes": True}
+
+
+class ApprovalNodeOut(BaseModel):
+    id: int
+    order_id: int
+    level: ApprovalLevel
+    mode: ApprovalNodeMode
+    status: ApprovalNodeStatus
+    sort_order: int
+    approvers: list[ApprovalNodeApproverOut]
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class ApprovalRecordOut(BaseModel):
+    id: int
+    order_id: int
+    node_id: Optional[int]
+    approver: str
+    action_type: ApprovalActionType
+    comment: Optional[str]
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
 
 
 class PurchaseOrderOut(BaseModel):
@@ -43,9 +85,12 @@ class PurchaseOrderOut(BaseModel):
     applicant: str
     department: Optional[str]
     status: PurchaseStatus
-    current_level: Optional[ApprovalLevel]
+    idempotency_key: Optional[str]
+    current_node_id: Optional[int]
+    rule_version_id: Optional[int]
     items: list[PurchaseItemOut]
-    approvals: list["ApprovalRecordOut"]
+    nodes: list[ApprovalNodeOut]
+    approvals: list[ApprovalRecordOut]
     created_at: datetime
     updated_at: datetime
 
@@ -59,28 +104,59 @@ class PurchaseOrderSummary(BaseModel):
     applicant: str
     department: Optional[str]
     status: PurchaseStatus
-    current_level: Optional[ApprovalLevel]
+    current_node_id: Optional[int]
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class SubmitRequest(BaseModel):
+    idempotency_key: Optional[str] = Field(None, max_length=128)
 
 
 class ApprovalRequest(BaseModel):
     approver: str = Field(..., max_length=100)
-    action: ApprovalAction
+    action: ApprovalActionType = ApprovalActionType.APPROVE
     comment: Optional[str] = None
 
 
-class ApprovalRecordOut(BaseModel):
-    id: int
-    order_id: int
-    level: ApprovalLevel
-    approver: str
-    action: ApprovalAction
-    comment: Optional[str]
-    created_at: datetime
+class CountersignRequest(BaseModel):
+    initiator: str = Field(..., max_length=100)
+    approvers: list[str] = Field(..., min_length=2)
+    comment: Optional[str] = None
 
-    model_config = {"from_attributes": True}
+
+class AddSignRequest(BaseModel):
+    approver: str = Field(..., max_length=100)
+    added_approver: str = Field(..., max_length=100)
+    comment: Optional[str] = None
+
+
+class ParallelSignRequest(BaseModel):
+    initiator: str = Field(..., max_length=100)
+    approvers: list[str] = Field(..., min_length=2)
+    comment: Optional[str] = None
+
+
+class SkipRequest(BaseModel):
+    approver: str = Field(..., max_length=100)
+    comment: Optional[str] = None
+
+
+class ReturnRequest(BaseModel):
+    approver: str = Field(..., max_length=100)
+    comment: Optional[str] = None
+
+
+class WithdrawRequest(BaseModel):
+    applicant: str = Field(..., max_length=100)
+    comment: Optional[str] = None
+
+
+class ApprovalRouteOut(BaseModel):
+    amount: float
+    required_levels: list[ApprovalLevel]
+    description: str
 
 
 class ApprovalRuleCreate(BaseModel):
@@ -91,17 +167,36 @@ class ApprovalRuleCreate(BaseModel):
 
 class ApprovalRuleOut(ApprovalRuleCreate):
     id: int
-    is_active: bool
+    version_id: int
     created_at: datetime
-    updated_at: datetime
 
     model_config = {"from_attributes": True}
 
 
-class ApprovalRouteOut(BaseModel):
-    amount: float
-    required_levels: list[ApprovalLevel]
-    description: str
+class RuleVersionCreate(BaseModel):
+    description: Optional[str] = Field(None, max_length=500)
+    rules: list[ApprovalRuleCreate] = Field(..., min_length=1)
+
+
+class RuleVersionOut(BaseModel):
+    id: int
+    version_number: int
+    is_active: bool
+    description: Optional[str]
+    rules: list[ApprovalRuleOut]
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class RuleVersionSummary(BaseModel):
+    id: int
+    version_number: int
+    is_active: bool
+    description: Optional[str]
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
 
 
 class MessageOut(BaseModel):
