@@ -1,6 +1,11 @@
+import hashlib
+import json
+import time
 from datetime import datetime
+from functools import wraps
 
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import OperationalError, DBAPIError
 
 from app.models import (
     ApprovalLevel, ApprovalRule, ApprovalRuleVersion,
@@ -43,6 +48,68 @@ LEVEL_NAMES = {
     ApprovalLevel.CEO: "CEO",
 }
 
+MAX_LOCK_RETRY_ATTEMPTS = 5
+LOCK_RETRY_BASE_DELAY_MS = 50
+
+DEADLOCK_ERROR_CODES = {
+    "mysql": ["1213", "1205"],
+    "postgresql": ["40P01", "55P03"],
+    "sqlite": ["database is locked"],
+}
+
+DEFAULT_MIN_SKIP_LEVELS = 2
+
+VP_DELEGATE_LEVEL = ApprovalLevel.DIRECTOR
+
+
+def _is_deadlock_error(exception: Exception) -> bool:
+    error_str = str(exception).lower()
+    for dialect, codes in DEADLOCK_ERROR_CODES.items():
+        for code in codes:
+            if code.lower() in error_str:
+                return True
+    if "deadlock" in error_str or "lock wait timeout" in error_str:
+        return True
+    return False
+
+
+def with_lock_retry(max_retries: int = MAX_LOCK_RETRY_ATTEMPTS):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except (OperationalError, DBAPIError) as e:
+                    last_exception = e
+                    if not _is_deadlock_error(e):
+                        raise
+                    if attempt < max_retries - 1:
+                        delay = (LOCK_RETRY_BASE_DELAY_MS * (2 ** attempt)) / 1000.0
+                        time.sleep(delay)
+                        if "db" in kwargs:
+                            kwargs["db"].rollback()
+                        elif args:
+                            for arg in args:
+                                if isinstance(arg, Session):
+                                    arg.rollback()
+                                    break
+                    else:
+                        raise RuntimeError(
+                            f"获取锁失败，已重试 {max_retries} 次: {e}"
+                        ) from e
+            raise last_exception
+        return wrapper
+    return decorator
+
+
+def _hash_payload(payload: dict | None) -> str | None:
+    if payload is None:
+        return None
+    canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
 
 def init_default_rule_version(db: Session) -> ApprovalRuleVersion:
     existing = db.query(ApprovalRuleVersion).first()
@@ -53,6 +120,7 @@ def init_default_rule_version(db: Session) -> ApprovalRuleVersion:
         version_number=1,
         is_active=True,
         min_skip_amount=50000,
+        min_skip_levels=DEFAULT_MIN_SKIP_LEVELS,
         description="默认审批规则",
     )
     db.add(version)
@@ -171,21 +239,39 @@ def _get_current_node(db: Session, order: PurchaseOrder, lock: bool = False) -> 
 
 def _check_idempotency_key(
     db: Session, idempotency_key: str | None, order_id: int,
+    payload: dict | None = None,
 ) -> ApprovalRecord | None:
     if not idempotency_key:
         return None
-    return (
+
+    record = (
         db.query(ApprovalRecord)
         .filter(ApprovalRecord.idempotency_key == idempotency_key)
-        .filter(ApprovalRecord.order_id == order_id)
         .first()
     )
+
+    if record is None:
+        return None
+
+    if record.order_id != order_id:
+        raise ValueError("幂等键已被其他订单使用，请使用唯一的幂等键")
+
+    if payload is not None and record.idempotency_payload_hash is not None:
+        payload_hash = _hash_payload(payload)
+        if payload_hash != record.idempotency_payload_hash:
+            raise ValueError(
+                "幂等键已存在但请求内容不匹配，"
+                "请使用不同的幂等键发起新请求"
+            )
+
+    return record
 
 
 def _create_audit_record(
     db: Session, order: PurchaseOrder, node: ApprovalNode | None,
     approver: str, action_type: ApprovalActionType, comment: str | None,
     idempotency_key: str | None = None,
+    idempotency_payload_hash: str | None = None,
 ) -> ApprovalRecord:
     record = ApprovalRecord(
         order_id=order.id,
@@ -193,6 +279,7 @@ def _create_audit_record(
         approver=approver,
         action_type=action_type,
         idempotency_key=idempotency_key,
+        idempotency_payload_hash=idempotency_payload_hash,
         comment=comment,
     )
     db.add(record)
@@ -233,20 +320,36 @@ def _advance_to_next_node(db: Session, order: PurchaseOrder, current_node: Appro
 
 def _handle_absent_approver(
     db: Session, node: ApprovalNode, approver: ApprovalNodeApprover,
-) -> None:
-    if not approver.backup_approver:
-        return
+) -> str | None:
+    if approver.backup_approver:
+        backup = ApprovalNodeApprover(
+            node_id=node.id,
+            approver=approver.backup_approver,
+            acted=False,
+            is_absent=False,
+            backup_approver=None,
+        )
+        db.add(backup)
+        approver.is_absent = True
+        db.flush()
+        return approver.backup_approver
 
-    backup = ApprovalNodeApprover(
-        node_id=node.id,
-        approver=approver.backup_approver,
-        acted=False,
-        is_absent=False,
-        backup_approver=None,
-    )
-    db.add(backup)
-    approver.is_absent = True
-    db.flush()
+    if node.level == ApprovalLevel.VP:
+        delegate_level = VP_DELEGATE_LEVEL
+        delegate_name = f"{delegate_level.value}_delegate"
+        delegate = ApprovalNodeApprover(
+            node_id=node.id,
+            approver=delegate_name,
+            acted=False,
+            is_absent=False,
+            backup_approver=None,
+        )
+        db.add(delegate)
+        approver.is_absent = True
+        db.flush()
+        return delegate_name
+
+    return None
 
 
 def _check_skip_threshold(db: Session, order: PurchaseOrder) -> None:
@@ -272,39 +375,69 @@ def _check_skip_threshold(db: Session, order: PurchaseOrder) -> None:
         if remaining < 1:
             raise ValueError("当前已是最后一级审批，无法跳级")
 
+        min_skip_levels = getattr(version, "min_skip_levels", DEFAULT_MIN_SKIP_LEVELS)
+        if remaining < min_skip_levels:
+            raise ValueError(
+                f"跳级审批要求至少剩余 {min_skip_levels} 级待审批，"
+                f"当前仅剩余 {remaining} 级，组织架构调整后请使用正常审批流程"
+            )
+
 
 def _cleanup_pending_orders_on_rollback(db: Session, old_version_id: int) -> list[int]:
-    pending_orders = (
+    affected_orders = (
         db.query(PurchaseOrder)
         .filter(PurchaseOrder.rule_version_id == old_version_id)
-        .filter(PurchaseOrder.status == PurchaseStatus.PENDING)
+        .filter(PurchaseOrder.status.in_([
+            PurchaseStatus.PENDING,
+        ]))
         .all()
     )
 
     affected_order_ids = []
-    for order in pending_orders:
-        db.query(ApprovalNodeApprover).filter(
-            ApprovalNodeApprover.node_id.in_(
-                db.query(ApprovalNode.id).filter(ApprovalNode.order_id == order.id)
-            )
-        ).delete(synchronize_session=False)
+    for order in affected_orders:
+        has_active_nodes = (
+            db.query(ApprovalNode)
+            .filter(ApprovalNode.order_id == order.id)
+            .filter(ApprovalNode.status == ApprovalNodeStatus.PENDING)
+            .first() is not None
+        )
 
-        db.query(ApprovalNode).filter(
-            ApprovalNode.order_id == order.id
-        ).delete(synchronize_session=False)
+        has_incomplete_nodes = (
+            db.query(ApprovalNode)
+            .filter(ApprovalNode.order_id == order.id)
+            .filter(ApprovalNode.status.notin_([
+                ApprovalNodeStatus.APPROVED,
+                ApprovalNodeStatus.REJECTED,
+                ApprovalNodeStatus.SKIPPED,
+            ]))
+            .first() is not None
+        )
 
-        order.rule_version_id = None
-        order.current_node_id = None
-        order.status = PurchaseStatus.DRAFT
-        affected_order_ids.append(order.id)
+        if order.status == PurchaseStatus.PENDING or has_active_nodes or has_incomplete_nodes:
+            db.query(ApprovalNodeApprover).filter(
+                ApprovalNodeApprover.node_id.in_(
+                    db.query(ApprovalNode.id).filter(ApprovalNode.order_id == order.id)
+                )
+            ).delete(synchronize_session=False)
+
+            db.query(ApprovalNode).filter(
+                ApprovalNode.order_id == order.id
+            ).delete(synchronize_session=False)
+
+            order.rule_version_id = None
+            order.current_node_id = None
+            order.status = PurchaseStatus.DRAFT
+            affected_order_ids.append(order.id)
 
     db.flush()
     return affected_order_ids
 
 
+@with_lock_retry(max_retries=MAX_LOCK_RETRY_ATTEMPTS)
 def process_approve(
     db: Session, order: PurchaseOrder, approver: str, comment: str | None,
     idempotency_key: str | None = None,
+    idempotency_payload_hash: str | None = None,
 ) -> PurchaseOrder:
     existing = _check_idempotency_key(db, idempotency_key, order.id)
     if existing:
@@ -321,11 +454,13 @@ def process_approve(
             ApprovalNodeApprover.approver == approver,
         ).first()
         if approver_entry and approver_entry.is_absent:
-            _handle_absent_approver(db, node, approver_entry)
-            approver = approver_entry.backup_approver
+            backup_approver = _handle_absent_approver(db, node, approver_entry)
+            if backup_approver:
+                approver = backup_approver
 
     _create_audit_record(
-        db, order, node, approver, ApprovalActionType.APPROVE, comment, idempotency_key,
+        db, order, node, approver, ApprovalActionType.APPROVE, comment,
+        idempotency_key, idempotency_payload_hash,
     )
 
     if node.mode == ApprovalNodeMode.SEQUENTIAL:
@@ -355,9 +490,11 @@ def process_approve(
     return order
 
 
+@with_lock_retry(max_retries=MAX_LOCK_RETRY_ATTEMPTS)
 def process_reject(
     db: Session, order: PurchaseOrder, approver: str, comment: str | None,
     idempotency_key: str | None = None,
+    idempotency_payload_hash: str | None = None,
 ) -> PurchaseOrder:
     existing = _check_idempotency_key(db, idempotency_key, order.id)
     if existing:
@@ -368,7 +505,8 @@ def process_reject(
         raise ValueError("采购单当前无待审批节点")
 
     _create_audit_record(
-        db, order, node, approver, ApprovalActionType.REJECT, comment, idempotency_key,
+        db, order, node, approver, ApprovalActionType.REJECT, comment,
+        idempotency_key, idempotency_payload_hash,
     )
     _mark_approver(db, node, approver, ApprovalActionType.REJECT, comment)
 
@@ -381,10 +519,12 @@ def process_reject(
     return order
 
 
+@with_lock_retry(max_retries=MAX_LOCK_RETRY_ATTEMPTS)
 def process_countersign(
     db: Session, order: PurchaseOrder, initiator: str,
     approvers: list[str], comment: str | None,
     idempotency_key: str | None = None,
+    idempotency_payload_hash: str | None = None,
 ) -> PurchaseOrder:
     existing = _check_idempotency_key(db, idempotency_key, order.id)
     if existing:
@@ -395,7 +535,8 @@ def process_countersign(
         raise ValueError("采购单当前无待审批节点")
 
     _create_audit_record(
-        db, order, node, initiator, ApprovalActionType.COUNTERSIGN, comment, idempotency_key,
+        db, order, node, initiator, ApprovalActionType.COUNTERSIGN, comment,
+        idempotency_key, idempotency_payload_hash,
     )
 
     node.mode = ApprovalNodeMode.COUNTERSIGN
@@ -446,11 +587,13 @@ def process_countersign(
     return order
 
 
+@with_lock_retry(max_retries=MAX_LOCK_RETRY_ATTEMPTS)
 def process_add_sign(
     db: Session, order: PurchaseOrder, approver: str,
     added_approver: str, comment: str | None,
     backup_approver: str | None = None,
     idempotency_key: str | None = None,
+    idempotency_payload_hash: str | None = None,
 ) -> PurchaseOrder:
     existing = _check_idempotency_key(db, idempotency_key, order.id)
     if existing:
@@ -461,7 +604,8 @@ def process_add_sign(
         raise ValueError("采购单当前无待审批节点")
 
     _create_audit_record(
-        db, order, node, approver, ApprovalActionType.ADD_SIGN, comment, idempotency_key,
+        db, order, node, approver, ApprovalActionType.ADD_SIGN, comment,
+        idempotency_key, idempotency_payload_hash,
     )
 
     existing = db.query(ApprovalNodeApprover).filter(
@@ -492,10 +636,12 @@ def process_add_sign(
     return order
 
 
+@with_lock_retry(max_retries=MAX_LOCK_RETRY_ATTEMPTS)
 def process_parallel_sign(
     db: Session, order: PurchaseOrder, initiator: str,
     approvers: list[str], comment: str | None,
     idempotency_key: str | None = None,
+    idempotency_payload_hash: str | None = None,
 ) -> PurchaseOrder:
     existing = _check_idempotency_key(db, idempotency_key, order.id)
     if existing:
@@ -506,7 +652,8 @@ def process_parallel_sign(
         raise ValueError("采购单当前无待审批节点")
 
     _create_audit_record(
-        db, order, node, initiator, ApprovalActionType.PARALLEL_SIGN, comment, idempotency_key,
+        db, order, node, initiator, ApprovalActionType.PARALLEL_SIGN, comment,
+        idempotency_key, idempotency_payload_hash,
     )
 
     node.mode = ApprovalNodeMode.PARALLEL
@@ -525,9 +672,11 @@ def process_parallel_sign(
     return order
 
 
+@with_lock_retry(max_retries=MAX_LOCK_RETRY_ATTEMPTS)
 def process_skip(
     db: Session, order: PurchaseOrder, approver: str, comment: str | None,
     idempotency_key: str | None = None,
+    idempotency_payload_hash: str | None = None,
 ) -> PurchaseOrder:
     existing = _check_idempotency_key(db, idempotency_key, order.id)
     if existing:
@@ -540,7 +689,8 @@ def process_skip(
         raise ValueError("采购单当前无待审批节点")
 
     _create_audit_record(
-        db, order, node, approver, ApprovalActionType.SKIP, comment, idempotency_key,
+        db, order, node, approver, ApprovalActionType.SKIP, comment,
+        idempotency_key, idempotency_payload_hash,
     )
 
     node.status = ApprovalNodeStatus.SKIPPED
@@ -551,9 +701,11 @@ def process_skip(
     return order
 
 
+@with_lock_retry(max_retries=MAX_LOCK_RETRY_ATTEMPTS)
 def process_return(
     db: Session, order: PurchaseOrder, approver: str, comment: str | None,
     idempotency_key: str | None = None,
+    idempotency_payload_hash: str | None = None,
 ) -> PurchaseOrder:
     existing = _check_idempotency_key(db, idempotency_key, order.id)
     if existing:
@@ -564,7 +716,8 @@ def process_return(
         raise ValueError("采购单当前无待审批节点")
 
     _create_audit_record(
-        db, order, node, approver, ApprovalActionType.RETURN, comment, idempotency_key,
+        db, order, node, approver, ApprovalActionType.RETURN, comment,
+        idempotency_key, idempotency_payload_hash,
     )
 
     nodes = _get_order_nodes(db, order)
@@ -590,9 +743,11 @@ def process_return(
     return order
 
 
+@with_lock_retry(max_retries=MAX_LOCK_RETRY_ATTEMPTS)
 def process_withdraw(
     db: Session, order: PurchaseOrder, applicant: str, comment: str | None,
     idempotency_key: str | None = None,
+    idempotency_payload_hash: str | None = None,
 ) -> PurchaseOrder:
     existing = _check_idempotency_key(db, idempotency_key, order.id)
     if existing:
@@ -602,7 +757,8 @@ def process_withdraw(
         raise ValueError("仅申请人可撤回采购单")
 
     _create_audit_record(
-        db, order, None, applicant, ApprovalActionType.WITHDRAW, comment, idempotency_key,
+        db, order, None, applicant, ApprovalActionType.WITHDRAW, comment,
+        idempotency_key, idempotency_payload_hash,
     )
 
     db.query(ApprovalNodeApprover).filter(
@@ -661,6 +817,7 @@ def create_rule_version(db: Session, data: RuleVersionCreate) -> ApprovalRuleVer
         version_number=next_version,
         is_active=True,
         min_skip_amount=data.min_skip_amount,
+        min_skip_levels=data.min_skip_levels,
         description=data.description,
     )
     db.add(version)

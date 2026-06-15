@@ -22,7 +22,7 @@ from app.services.approval import (
     process_skip, process_return, process_withdraw,
     create_rule_version, activate_rule_version, deactivate_rule_version,
     rollback_rule_version, get_active_rule_version,
-    _check_idempotency_key,
+    _check_idempotency_key, _hash_payload,
 )
 
 router = APIRouter(prefix="/api/purchase-orders", tags=["采购单"])
@@ -30,11 +30,16 @@ router = APIRouter(prefix="/api/purchase-orders", tags=["采购单"])
 
 def _precheck_idempotency(
     db: Session, order_id: int, idempotency_key: str | None,
+    payload: dict | None = None,
 ) -> PurchaseOrder | None:
     if not idempotency_key:
         return None
 
-    existing_record = _check_idempotency_key(db, idempotency_key, order_id)
+    try:
+        existing_record = _check_idempotency_key(db, idempotency_key, order_id, payload)
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
     if existing_record:
         return _load_order(db, order_id)
     return None
@@ -108,7 +113,8 @@ def submit_purchase_order(order_id: int, db: Session = Depends(get_db)):
 
 @router.post("/{order_id}/approve", response_model=PurchaseOrderOut)
 def approve_purchase_order(order_id: int, data: ApprovalRequest, db: Session = Depends(get_db)):
-    existing = _precheck_idempotency(db, order_id, data.idempotency_key)
+    payload = data.model_dump() if data.idempotency_key else None
+    existing = _precheck_idempotency(db, order_id, data.idempotency_key, payload)
     if existing:
         return existing
 
@@ -123,11 +129,13 @@ def approve_purchase_order(order_id: int, data: ApprovalRequest, db: Session = D
             order = process_reject(
                 db, order, data.approver, data.comment,
                 idempotency_key=data.idempotency_key,
+                idempotency_payload_hash=_hash_payload(payload),
             )
         else:
             order = process_approve(
                 db, order, data.approver, data.comment,
                 idempotency_key=data.idempotency_key,
+                idempotency_payload_hash=_hash_payload(payload),
             )
     except Exception as e:
         _handle_approval_exception(e)
@@ -137,7 +145,8 @@ def approve_purchase_order(order_id: int, data: ApprovalRequest, db: Session = D
 
 @router.post("/{order_id}/countersign", response_model=PurchaseOrderOut)
 def countersign_purchase_order(order_id: int, data: CountersignRequest, db: Session = Depends(get_db)):
-    existing = _precheck_idempotency(db, order_id, data.idempotency_key)
+    payload = data.model_dump() if data.idempotency_key else None
+    existing = _precheck_idempotency(db, order_id, data.idempotency_key, payload)
     if existing:
         return existing
 
@@ -151,6 +160,7 @@ def countersign_purchase_order(order_id: int, data: CountersignRequest, db: Sess
         order = process_countersign(
             db, order, data.initiator, data.approvers, data.comment,
             idempotency_key=data.idempotency_key,
+            idempotency_payload_hash=_hash_payload(payload),
         )
     except Exception as e:
         _handle_approval_exception(e)
@@ -160,7 +170,8 @@ def countersign_purchase_order(order_id: int, data: CountersignRequest, db: Sess
 
 @router.post("/{order_id}/add-sign", response_model=PurchaseOrderOut)
 def add_sign_purchase_order(order_id: int, data: AddSignRequest, db: Session = Depends(get_db)):
-    existing = _precheck_idempotency(db, order_id, data.idempotency_key)
+    payload = data.model_dump() if data.idempotency_key else None
+    existing = _precheck_idempotency(db, order_id, data.idempotency_key, payload)
     if existing:
         return existing
 
@@ -175,6 +186,7 @@ def add_sign_purchase_order(order_id: int, data: AddSignRequest, db: Session = D
             db, order, data.approver, data.added_approver, data.comment,
             backup_approver=data.backup_approver,
             idempotency_key=data.idempotency_key,
+            idempotency_payload_hash=_hash_payload(payload),
         )
     except Exception as e:
         _handle_approval_exception(e)
@@ -184,7 +196,8 @@ def add_sign_purchase_order(order_id: int, data: AddSignRequest, db: Session = D
 
 @router.post("/{order_id}/parallel-sign", response_model=PurchaseOrderOut)
 def parallel_sign_purchase_order(order_id: int, data: ParallelSignRequest, db: Session = Depends(get_db)):
-    existing = _precheck_idempotency(db, order_id, data.idempotency_key)
+    payload = data.model_dump() if data.idempotency_key else None
+    existing = _precheck_idempotency(db, order_id, data.idempotency_key, payload)
     if existing:
         return existing
 
@@ -198,6 +211,7 @@ def parallel_sign_purchase_order(order_id: int, data: ParallelSignRequest, db: S
         order = process_parallel_sign(
             db, order, data.initiator, data.approvers, data.comment,
             idempotency_key=data.idempotency_key,
+            idempotency_payload_hash=_hash_payload(payload),
         )
     except Exception as e:
         _handle_approval_exception(e)
@@ -207,7 +221,8 @@ def parallel_sign_purchase_order(order_id: int, data: ParallelSignRequest, db: S
 
 @router.post("/{order_id}/skip", response_model=PurchaseOrderOut)
 def skip_purchase_order(order_id: int, data: SkipRequest, db: Session = Depends(get_db)):
-    existing = _precheck_idempotency(db, order_id, data.idempotency_key)
+    payload = data.model_dump() if data.idempotency_key else None
+    existing = _precheck_idempotency(db, order_id, data.idempotency_key, payload)
     if existing:
         return existing
 
@@ -221,6 +236,7 @@ def skip_purchase_order(order_id: int, data: SkipRequest, db: Session = Depends(
         order = process_skip(
             db, order, data.approver, data.comment,
             idempotency_key=data.idempotency_key,
+            idempotency_payload_hash=_hash_payload(payload),
         )
     except Exception as e:
         _handle_approval_exception(e)
@@ -230,7 +246,8 @@ def skip_purchase_order(order_id: int, data: SkipRequest, db: Session = Depends(
 
 @router.post("/{order_id}/return", response_model=PurchaseOrderOut)
 def return_purchase_order(order_id: int, data: ReturnRequest, db: Session = Depends(get_db)):
-    existing = _precheck_idempotency(db, order_id, data.idempotency_key)
+    payload = data.model_dump() if data.idempotency_key else None
+    existing = _precheck_idempotency(db, order_id, data.idempotency_key, payload)
     if existing:
         return existing
 
@@ -244,6 +261,7 @@ def return_purchase_order(order_id: int, data: ReturnRequest, db: Session = Depe
         order = process_return(
             db, order, data.approver, data.comment,
             idempotency_key=data.idempotency_key,
+            idempotency_payload_hash=_hash_payload(payload),
         )
     except Exception as e:
         _handle_approval_exception(e)
@@ -253,7 +271,8 @@ def return_purchase_order(order_id: int, data: ReturnRequest, db: Session = Depe
 
 @router.post("/{order_id}/withdraw", response_model=PurchaseOrderOut)
 def withdraw_purchase_order(order_id: int, data: WithdrawRequest, db: Session = Depends(get_db)):
-    existing = _precheck_idempotency(db, order_id, data.idempotency_key)
+    payload = data.model_dump() if data.idempotency_key else None
+    existing = _precheck_idempotency(db, order_id, data.idempotency_key, payload)
     if existing:
         return existing
 
@@ -267,6 +286,7 @@ def withdraw_purchase_order(order_id: int, data: WithdrawRequest, db: Session = 
         order = process_withdraw(
             db, order, data.applicant, data.comment,
             idempotency_key=data.idempotency_key,
+            idempotency_payload_hash=_hash_payload(payload),
         )
     except Exception as e:
         _handle_approval_exception(e)

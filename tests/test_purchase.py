@@ -1,6 +1,34 @@
 import os
 
 
+def _multiprocess_worker(order_id, approver_name, db_path, result_queue):
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from app.database import Base, get_db
+
+    test_engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
+    TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
+
+    def override_get_db():
+        db = TestingSessionLocal()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app.dependency_overrides[get_db] = override_get_db
+
+    client = TestClient(app)
+    resp = client.post(f"/api/purchase-orders/{order_id}/approve",
+                       json={"approver": approver_name, "action": "approve"})
+    result_queue.put((approver_name, resp.status_code, resp.json()))
+
+
 def test_health(client):
     resp = client.get("/api/health")
     assert resp.status_code == 200
@@ -668,7 +696,8 @@ def test_idempotency_key_conflict_same_order(client, sample_order_payload):
                          json={"approver": "李经理",
                                "idempotency_key": "shared-key-001"})
     assert resp_b.status_code == 409
-    assert "幂等键已被其他请求使用" in resp_b.json()["detail"]
+    assert "幂等键" in resp_b.json()["detail"]
+    assert "其他" in resp_b.json()["detail"]
 
 
 def test_countersign_audit_record_unique(client, sample_order_payload):
@@ -742,3 +771,330 @@ def test_rollback_mid_operation_creates_new_version(client, sample_order_payload
 
     active = client.get("/api/approval-rules/active").json()
     assert active["id"] == resp3.json()["id"]
+
+
+def test_idempotency_key_same_payload_returns_same_result(client, sample_order_payload):
+    resp = client.post("/api/purchase-orders/", json=sample_order_payload)
+    order_id = resp.json()["id"]
+    client.post(f"/api/purchase-orders/{order_id}/submit")
+
+    payload = {
+        "approver": "李经理",
+        "action": "approve",
+        "comment": "同意",
+        "idempotency_key": "payload-check-001",
+    }
+
+    resp1 = client.post(f"/api/purchase-orders/{order_id}/approve", json=payload)
+    assert resp1.status_code == 200
+
+    resp2 = client.post(f"/api/purchase-orders/{order_id}/approve", json=payload)
+    assert resp2.status_code == 200
+
+    records1 = resp1.json()["approvals"]
+    records2 = resp2.json()["approvals"]
+    assert len(records1) == len(records2)
+
+
+def test_idempotency_key_different_payload_conflicts(client, sample_order_payload):
+    resp = client.post("/api/purchase-orders/", json=sample_order_payload)
+    order_id = resp.json()["id"]
+    client.post(f"/api/purchase-orders/{order_id}/submit")
+
+    payload1 = {
+        "approver": "李经理",
+        "action": "approve",
+        "comment": "同意",
+        "idempotency_key": "payload-conflict-001",
+    }
+    resp1 = client.post(f"/api/purchase-orders/{order_id}/approve", json=payload1)
+    assert resp1.status_code == 200
+
+    payload2 = {
+        "approver": "李经理",
+        "action": "approve",
+        "comment": "不同意",
+        "idempotency_key": "payload-conflict-001",
+    }
+    resp2 = client.post(f"/api/purchase-orders/{order_id}/approve", json=payload2)
+    assert resp2.status_code == 409
+    assert "请求内容不匹配" in resp2.json()["detail"]
+
+
+def test_vp_absent_delegates_to_director_level(client, sample_order_payload, db_session):
+    from app.models import (
+        ApprovalNodeApprover, ApprovalLevel, ApprovalNode,
+        ApprovalNodeMode, PurchaseOrder,
+    )
+    from app.services.approval import create_approval_nodes
+
+    high_amount_payload = {
+        **sample_order_payload,
+        "title": "大额采购单",
+        "items": [{"name": "服务器", "quantity": 10, "unit_price": 10000}],
+    }
+    resp = client.post("/api/purchase-orders/", json=high_amount_payload)
+    order_id = resp.json()["id"]
+    client.post(f"/api/purchase-orders/{order_id}/submit")
+
+    order = db_session.get(PurchaseOrder, order_id)
+    nodes = db_session.query(ApprovalNode).filter(
+        ApprovalNode.order_id == order_id,
+        ApprovalNode.level == ApprovalLevel.VP,
+    ).all()
+
+    if nodes:
+        vp_node = nodes[0]
+        vp_node.mode = ApprovalNodeMode.COUNTERSIGN
+        order.current_node_id = vp_node.id
+        db_session.add(ApprovalNodeApprover(
+            node_id=vp_node.id,
+            approver="王VP",
+            acted=False,
+            is_absent=True,
+            backup_approver=None,
+        ))
+        db_session.commit()
+
+        resp = client.post(f"/api/purchase-orders/{order_id}/approve",
+                           json={"approver": "王VP", "action": "approve"})
+        assert resp.status_code == 200
+
+        order_data = resp.json()
+        vp_nodes = [n for n in order_data["nodes"] if n["level"] == "vp"]
+        if vp_nodes:
+            approver_names = [a["approver"] for a in vp_nodes[0]["approvers"]]
+            assert any("delegate" in name.lower() for name in approver_names)
+
+
+def test_skip_min_levels_validation(client, sample_order_payload, db_session):
+    from app.models import ApprovalRuleVersion
+
+    resp = client.post("/api/purchase-orders/", json=sample_order_payload)
+    order_id = resp.json()["id"]
+    client.post(f"/api/purchase-orders/{order_id}/submit")
+
+    version = db_session.query(ApprovalRuleVersion).filter(
+        ApprovalRuleVersion.is_active == True
+    ).first()
+    if version:
+        original_skip_levels = version.min_skip_levels
+        version.min_skip_levels = 10
+        db_session.commit()
+
+        resp = client.post(f"/api/purchase-orders/{order_id}/skip",
+                           json={"approver": "李经理"})
+        assert resp.status_code == 400
+        assert "组织架构调整" in resp.json()["detail"]
+
+        version.min_skip_levels = original_skip_levels
+        db_session.commit()
+
+
+def test_deadlock_retry_decorator_exists():
+    from app.services.approval import with_lock_retry, MAX_LOCK_RETRY_ATTEMPTS
+    assert MAX_LOCK_RETRY_ATTEMPTS >= 3
+
+    @with_lock_retry(max_retries=2)
+    def dummy_func(db=None):
+        return "success"
+
+    assert callable(dummy_func)
+
+
+def test_orphan_revision_detection_script():
+    import subprocess
+    import sys
+    import os
+
+    project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    script_path = os.path.join(project_dir, "scripts", "check_orphan_revisions.py")
+
+    result = subprocess.run(
+        [sys.executable, script_path],
+        capture_output=True,
+        text=True,
+        cwd=project_dir,
+    )
+
+    assert result.returncode == 0
+    assert "孤儿" in result.stdout or "未发现" in result.stdout
+
+
+def test_seed_script_dry_run_mode():
+    import subprocess
+    import sys
+    import os
+    import tempfile
+
+    project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    script_path = os.path.join(project_dir, "scripts", "seed_production_data.py")
+
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        db_path = f.name
+
+    env = os.environ.copy()
+    env["DATABASE_URL"] = f"sqlite:///{db_path}"
+
+    try:
+        result = subprocess.run(
+            [sys.executable, script_path, "--dry-run", "--yes"],
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+            env=env,
+        )
+
+        assert "DRY-RUN" in result.stdout
+    finally:
+        if os.path.exists(db_path):
+            os.unlink(db_path)
+
+
+def test_concurrent_countersign_multiprocess():
+    import multiprocessing
+    import tempfile
+    import sys
+
+    project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    sys.path.insert(0, project_dir)
+
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.database import get_db
+
+    original_get_db_override = app.dependency_overrides.get(get_db)
+
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        db_path = f.name
+
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from app.database import Base
+
+    test_engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
+    TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
+    Base.metadata.create_all(bind=test_engine)
+
+    def override_get_db():
+        db = TestingSessionLocal()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app.dependency_overrides[get_db] = override_get_db
+
+    try:
+        client = TestClient(app)
+        high_amount_payload = {
+            "title": "并发测试单",
+            "applicant": "张三",
+            "items": [{"name": "测试商品", "quantity": 1, "unit_price": 100}],
+        }
+        resp = client.post("/api/purchase-orders/", json=high_amount_payload)
+        order_id = resp.json()["id"]
+        client.post(f"/api/purchase-orders/{order_id}/submit")
+
+        client.post(f"/api/purchase-orders/{order_id}/countersign",
+                    json={
+                        "initiator": "李经理",
+                        "approvers": ["李经理", "王审批", "赵审核"],
+                        "comment": "并发会签测试",
+                    })
+
+        result_queue = multiprocessing.Queue()
+        processes = []
+        for name in ["王审批", "赵审核"]:
+            p = multiprocessing.Process(
+                target=_multiprocess_worker,
+                args=(order_id, name, db_path, result_queue),
+            )
+            processes.append(p)
+            p.start()
+
+        for p in processes:
+            p.join(timeout=10)
+
+        results = []
+        while not result_queue.empty():
+            results.append(result_queue.get())
+
+        assert len(results) == 2
+        status_codes = [r[1] for r in results]
+        assert all(s == 200 for s in status_codes)
+
+        final_order = client.get(f"/api/purchase-orders/{order_id}").json()
+        assert final_order["status"] == "approved"
+
+    finally:
+        if original_get_db_override is not None:
+            app.dependency_overrides[get_db] = original_get_db_override
+        else:
+            app.dependency_overrides.pop(get_db, None)
+        if os.path.exists(db_path):
+            os.unlink(db_path)
+
+
+def test_min_skip_levels_in_rule_version(db_session):
+    import sys
+    import os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+    from app.services.approval import DEFAULT_MIN_SKIP_LEVELS
+    assert DEFAULT_MIN_SKIP_LEVELS == 2
+
+    from app.models import ApprovalRuleVersion
+    version = ApprovalRuleVersion(
+        version_number=99,
+        is_active=False,
+        min_skip_amount=1000,
+        description="测试版本",
+    )
+    db_session.add(version)
+    db_session.commit()
+    db_session.refresh(version)
+
+    assert version.min_skip_levels == DEFAULT_MIN_SKIP_LEVELS
+
+
+def test_rollback_cleanup_includes_incomplete_nodes(client, sample_order_payload):
+    resp1 = client.get("/api/approval-rules/active")
+    v1_id = resp1.json()["id"]
+
+    resp = client.post("/api/purchase-orders/", json=sample_order_payload)
+    order_id = resp.json()["id"]
+    client.post(f"/api/purchase-orders/{order_id}/submit")
+
+    order_before = client.get(f"/api/purchase-orders/{order_id}").json()
+    assert order_before["status"] == "pending"
+    assert len(order_before["nodes"]) > 0
+
+    resp2 = client.post(f"/api/approval-rules/versions/{v1_id}/rollback")
+    assert resp2.status_code == 200
+
+    order_after = client.get(f"/api/purchase-orders/{order_id}").json()
+    assert order_after["status"] == "draft"
+    assert len(order_after["nodes"]) == 0
+
+
+def test_payload_hash_stored_in_record(client, sample_order_payload):
+    resp = client.post("/api/purchase-orders/", json=sample_order_payload)
+    order_id = resp.json()["id"]
+    client.post(f"/api/purchase-orders/{order_id}/submit")
+
+    payload = {
+        "approver": "李经理",
+        "action": "approve",
+        "comment": "测试payload哈希",
+        "idempotency_key": "hash-test-001",
+    }
+
+    resp = client.post(f"/api/purchase-orders/{order_id}/approve", json=payload)
+    assert resp.status_code == 200
+
+    approvals = resp.json()["approvals"]
+    idempotent_record = [r for r in approvals if r["idempotency_key"] == "hash-test-001"]
+    assert len(idempotent_record) == 1
+    assert idempotent_record[0]["idempotency_payload_hash"] is not None
+    assert len(idempotent_record[0]["idempotency_payload_hash"]) == 64

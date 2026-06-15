@@ -74,6 +74,7 @@ class ApprovalRecordOut(BaseModel):
     approver: str
     action_type: ApprovalActionType
     idempotency_key: Optional[str]
+    idempotency_payload_hash: Optional[str]
     comment: Optional[str]
     created_at: datetime
 
@@ -187,6 +188,7 @@ class ApprovalRuleOut(ApprovalRuleCreate):
 class RuleVersionCreate(BaseModel):
     description: Optional[str] = Field(None, max_length=500)
     min_skip_amount: float = Field(50000, ge=0)
+    min_skip_levels: int = Field(2, ge=1)
     rules: list[ApprovalRuleCreate] = Field(..., min_length=1)
 
 
@@ -195,6 +197,7 @@ class RuleVersionOut(BaseModel):
     version_number: int
     is_active: bool
     min_skip_amount: float
+    min_skip_levels: int
     description: Optional[str]
     rules: list[ApprovalRuleOut]
     created_at: datetime
@@ -207,6 +210,7 @@ class RuleVersionSummary(BaseModel):
     version_number: int
     is_active: bool
     min_skip_amount: float
+    min_skip_levels: int
     description: Optional[str]
     created_at: datetime
 

@@ -125,6 +125,7 @@ class ApprovalRecord(Base):
     approver = Column(String(100), nullable=False)
     action_type = Column(Enum(ApprovalActionType), nullable=False)
     idempotency_key = Column(String(128), nullable=True, unique=True)
+    idempotency_payload_hash = Column(String(64), nullable=True)
     comment = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -139,6 +140,7 @@ class ApprovalRuleVersion(Base):
     version_number = Column(Integer, nullable=False, unique=True)
     is_active = Column(Boolean, default=True, nullable=False)
     min_skip_amount = Column(Float, default=50000, nullable=False)
+    min_skip_levels = Column(Integer, default=2, nullable=False)
     description = Column(String(500), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
