@@ -23,6 +23,7 @@ from app.services.approval import (
     create_rule_version, activate_rule_version, deactivate_rule_version,
     rollback_rule_version, get_active_rule_version,
     _check_idempotency_key, _hash_payload,
+    _log_idempotency_conflict,
 )
 
 router = APIRouter(prefix="/api/purchase-orders", tags=["采购单"])
@@ -38,6 +39,7 @@ def _precheck_idempotency(
     try:
         existing_record = _check_idempotency_key(db, idempotency_key, order_id, payload)
     except ValueError as e:
+        _log_idempotency_conflict(db, order_id, idempotency_key, str(e), payload)
         raise HTTPException(status_code=409, detail=str(e))
 
     if existing_record:
@@ -45,11 +47,13 @@ def _precheck_idempotency(
     return None
 
 
-def _handle_approval_exception(e: Exception) -> None:
+def _handle_approval_exception(e: Exception, db: Session = None, order_id: int = None) -> None:
     if isinstance(e, ValueError):
         raise HTTPException(status_code=400, detail=str(e))
     if isinstance(e, IntegrityError):
         if "idempotency_key" in str(e):
+            if db and order_id:
+                _log_idempotency_conflict(db, order_id, None, str(e))
             raise HTTPException(
                 status_code=409,
                 detail="幂等键已被其他请求使用，请使用唯一的幂等键"
@@ -446,15 +450,28 @@ def deactivate_version(version_id: int, db: Session = Depends(get_db)):
 
 
 @rule_router.post("/versions/{version_id}/rollback", response_model=RollbackResult)
-def rollback_version(version_id: int, db: Session = Depends(get_db)):
+def rollback_version(version_id: int, dry_run: bool = Query(False), db: Session = Depends(get_db)):
     try:
-        version, affected_order_ids = rollback_rule_version(db, version_id)
+        version, affected_order_ids, recalculated = rollback_rule_version(db, version_id, dry_run=dry_run)
+        recalculated_count = len(recalculated)
+        msg_parts = []
+        if dry_run:
+            msg_parts.append(f"[DRY-RUN] 将回滚到版本 {version.version_number}")
+        else:
+            msg_parts.append(f"已回滚到版本 {version.version_number}")
+        if affected_order_ids:
+            msg_parts.append(f"{len(affected_order_ids)} 个进行中的采购单将重置为草稿" if dry_run
+                             else f"{len(affected_order_ids)} 个进行中的采购单已重置为草稿")
+        if recalculated_count:
+            msg_parts.append(f"{recalculated_count} 个未结案工单已按新组织结构重算路由")
+        else:
+            if not dry_run:
+                msg_parts.append("无未结案工单需要重算路由")
         return RollbackResult(
             version=version,
             affected_pending_orders=affected_order_ids,
-            message=f"已回滚到版本 {version.version_number}，"
-                    f"{len(affected_order_ids)} 个进行中的采购单已重置为草稿"
-                    if affected_order_ids else f"已回滚到版本 {version.version_number}，无进行中的采购单受影响",
+            recalculated_orders=recalculated,
+            message="，".join(msg_parts) if msg_parts else f"已回滚到版本 {version.version_number}",
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))

@@ -222,7 +222,16 @@ class MessageOut(BaseModel):
     detail: Optional[str] = None
 
 
+class RecalculatedOrderInfo(BaseModel):
+    order_id: int
+    old_levels: list[str]
+    new_levels: list[str]
+
+    model_config = {"from_attributes": True}
+
+
 class RollbackResult(BaseModel):
     version: RuleVersionOut
     affected_pending_orders: list[int]
+    recalculated_orders: list[RecalculatedOrderInfo] = []
     message: str

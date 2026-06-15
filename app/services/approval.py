@@ -1,5 +1,6 @@
 import hashlib
 import json
+import random
 import time
 from datetime import datetime
 from functools import wraps
@@ -50,6 +51,7 @@ LEVEL_NAMES = {
 
 MAX_LOCK_RETRY_ATTEMPTS = 5
 LOCK_RETRY_BASE_DELAY_MS = 50
+LOCK_RETRY_JITTER_MS = 30
 
 DEADLOCK_ERROR_CODES = {
     "mysql": ["1213", "1205"],
@@ -60,6 +62,7 @@ DEADLOCK_ERROR_CODES = {
 DEFAULT_MIN_SKIP_LEVELS = 2
 
 VP_DELEGATE_LEVEL = ApprovalLevel.DIRECTOR
+VP_SECONDARY_FALLBACK_LEVEL = ApprovalLevel.MANAGER
 
 
 def _is_deadlock_error(exception: Exception) -> bool:
@@ -86,8 +89,9 @@ def with_lock_retry(max_retries: int = MAX_LOCK_RETRY_ATTEMPTS):
                     if not _is_deadlock_error(e):
                         raise
                     if attempt < max_retries - 1:
-                        delay = (LOCK_RETRY_BASE_DELAY_MS * (2 ** attempt)) / 1000.0
-                        time.sleep(delay)
+                        base_delay = (LOCK_RETRY_BASE_DELAY_MS * (2 ** attempt)) / 1000.0
+                        jitter = random.uniform(0, LOCK_RETRY_JITTER_MS) / 1000.0
+                        time.sleep(base_delay + jitter)
                         if "db" in kwargs:
                             kwargs["db"].rollback()
                         elif args:
@@ -287,6 +291,24 @@ def _create_audit_record(
     return record
 
 
+def _log_idempotency_conflict(
+    db: Session, order_id: int, idempotency_key: str | None,
+    conflict_reason: str, payload: dict | None = None,
+) -> None:
+    payload_hash = _hash_payload(payload) if payload else None
+    record = ApprovalRecord(
+        order_id=order_id,
+        node_id=None,
+        approver="system",
+        action_type=ApprovalActionType.APPROVE,
+        idempotency_key=None,
+        idempotency_payload_hash=payload_hash,
+        comment=f"[IDEMPOTENCY_CONFLICT] key={idempotency_key}, reason={conflict_reason}",
+    )
+    db.add(record)
+    db.commit()
+
+
 def _get_order_nodes(db: Session, order: PurchaseOrder) -> list[ApprovalNode]:
     return (
         db.query(ApprovalNode)
@@ -322,29 +344,77 @@ def _handle_absent_approver(
     db: Session, node: ApprovalNode, approver: ApprovalNodeApprover,
 ) -> str | None:
     if approver.backup_approver:
-        backup = ApprovalNodeApprover(
-            node_id=node.id,
-            approver=approver.backup_approver,
-            acted=False,
-            is_absent=False,
-            backup_approver=None,
-        )
-        db.add(backup)
+        backup_name = approver.backup_approver
+        backup_entry = db.query(ApprovalNodeApprover).filter(
+            ApprovalNodeApprover.node_id == node.id,
+            ApprovalNodeApprover.approver == backup_name,
+        ).first()
+        if backup_entry and backup_entry.is_absent:
+            if node.level == ApprovalLevel.VP:
+                fallback_name = f"{VP_SECONDARY_FALLBACK_LEVEL.value}_fallback"
+                fallback = ApprovalNodeApprover(
+                    node_id=node.id,
+                    approver=fallback_name,
+                    acted=False,
+                    is_absent=False,
+                    backup_approver=None,
+                )
+                db.add(fallback)
+                approver.is_absent = True
+                db.flush()
+                return fallback_name
+            return None
+
+        if not backup_entry:
+            backup = ApprovalNodeApprover(
+                node_id=node.id,
+                approver=backup_name,
+                acted=False,
+                is_absent=False,
+                backup_approver=None,
+            )
+            db.add(backup)
         approver.is_absent = True
         db.flush()
-        return approver.backup_approver
+        return backup_name
 
     if node.level == ApprovalLevel.VP:
         delegate_level = VP_DELEGATE_LEVEL
         delegate_name = f"{delegate_level.value}_delegate"
-        delegate = ApprovalNodeApprover(
-            node_id=node.id,
-            approver=delegate_name,
-            acted=False,
-            is_absent=False,
-            backup_approver=None,
-        )
-        db.add(delegate)
+
+        existing_delegate = db.query(ApprovalNodeApprover).filter(
+            ApprovalNodeApprover.node_id == node.id,
+            ApprovalNodeApprover.approver == delegate_name,
+        ).first()
+
+        if existing_delegate and existing_delegate.is_absent:
+            fallback_name = f"{VP_SECONDARY_FALLBACK_LEVEL.value}_fallback"
+            existing_fallback = db.query(ApprovalNodeApprover).filter(
+                ApprovalNodeApprover.node_id == node.id,
+                ApprovalNodeApprover.approver == fallback_name,
+            ).first()
+            if not existing_fallback:
+                fallback = ApprovalNodeApprover(
+                    node_id=node.id,
+                    approver=fallback_name,
+                    acted=False,
+                    is_absent=False,
+                    backup_approver=None,
+                )
+                db.add(fallback)
+                db.flush()
+            approver.is_absent = True
+            return fallback_name
+
+        if not existing_delegate:
+            delegate = ApprovalNodeApprover(
+                node_id=node.id,
+                approver=delegate_name,
+                acted=False,
+                is_absent=False,
+                backup_approver=None,
+            )
+            db.add(delegate)
         approver.is_absent = True
         db.flush()
         return delegate_name
@@ -383,7 +453,7 @@ def _check_skip_threshold(db: Session, order: PurchaseOrder) -> None:
             )
 
 
-def _cleanup_pending_orders_on_rollback(db: Session, old_version_id: int) -> list[int]:
+def _cleanup_pending_orders_on_rollback(db: Session, old_version_id: int, dry_run: bool = False) -> list[int]:
     affected_orders = (
         db.query(PurchaseOrder)
         .filter(PurchaseOrder.rule_version_id == old_version_id)
@@ -414,6 +484,50 @@ def _cleanup_pending_orders_on_rollback(db: Session, old_version_id: int) -> lis
         )
 
         if order.status == PurchaseStatus.PENDING or has_active_nodes or has_incomplete_nodes:
+            if not dry_run:
+                db.query(ApprovalNodeApprover).filter(
+                    ApprovalNodeApprover.node_id.in_(
+                        db.query(ApprovalNode.id).filter(ApprovalNode.order_id == order.id)
+                    )
+                ).delete(synchronize_session=False)
+
+                db.query(ApprovalNode).filter(
+                    ApprovalNode.order_id == order.id
+                ).delete(synchronize_session=False)
+
+                order.rule_version_id = None
+                order.current_node_id = None
+                order.status = PurchaseStatus.DRAFT
+            affected_order_ids.append(order.id)
+
+    if not dry_run:
+        db.flush()
+    return affected_order_ids
+
+
+def recalculate_pending_orders_route(db: Session) -> list[dict]:
+    pending_orders = (
+        db.query(PurchaseOrder)
+        .filter(PurchaseOrder.status == PurchaseStatus.PENDING)
+        .all()
+    )
+
+    recalculated = []
+    active_version = get_active_rule_version(db)
+    if not active_version:
+        return recalculated
+
+    for order in pending_orders:
+        old_nodes = _get_order_nodes(db, order)
+        approved_levels = set()
+        for node in old_nodes:
+            if node.status == ApprovalNodeStatus.APPROVED:
+                approved_levels.add(node.level)
+
+        current_route = get_approval_route(order.total_amount, db)
+        new_levels = current_route.required_levels
+
+        if [n.level for n in old_nodes] != new_levels:
             db.query(ApprovalNodeApprover).filter(
                 ApprovalNodeApprover.node_id.in_(
                     db.query(ApprovalNode.id).filter(ApprovalNode.order_id == order.id)
@@ -424,13 +538,40 @@ def _cleanup_pending_orders_on_rollback(db: Session, old_version_id: int) -> lis
                 ApprovalNode.order_id == order.id
             ).delete(synchronize_session=False)
 
-            order.rule_version_id = None
-            order.current_node_id = None
-            order.status = PurchaseStatus.DRAFT
-            affected_order_ids.append(order.id)
+            order.rule_version_id = active_version.id
+
+            new_nodes = []
+            for idx, level in enumerate(new_levels, start=1):
+                node = ApprovalNode(
+                    order_id=order.id,
+                    level=level,
+                    mode=ApprovalNodeMode.SEQUENTIAL,
+                    status=ApprovalNodeStatus.APPROVED if level in approved_levels else ApprovalNodeStatus.PENDING,
+                    sort_order=idx,
+                )
+                db.add(node)
+                new_nodes.append(node)
+
+            db.flush()
+
+            current_node = None
+            for node in new_nodes:
+                if node.status == ApprovalNodeStatus.PENDING:
+                    current_node = node
+                    break
+
+            order.current_node_id = current_node.id if current_node else None
+            if not current_node:
+                order.status = PurchaseStatus.APPROVED
+
+            recalculated.append({
+                "order_id": order.id,
+                "old_levels": [n.level for n in old_nodes],
+                "new_levels": new_levels,
+            })
 
     db.flush()
-    return affected_order_ids
+    return recalculated
 
 
 @with_lock_retry(max_retries=MAX_LOCK_RETRY_ATTEMPTS)
@@ -863,7 +1004,7 @@ def deactivate_rule_version(db: Session, version_id: int) -> ApprovalRuleVersion
     return version
 
 
-def rollback_rule_version(db: Session, version_id: int) -> tuple[ApprovalRuleVersion, list[int]]:
+def rollback_rule_version(db: Session, version_id: int, dry_run: bool = False) -> tuple[ApprovalRuleVersion, list[int], list[dict]]:
     current_active = get_active_rule_version(db)
     old_version_id = current_active.id if current_active else None
 
@@ -871,8 +1012,13 @@ def rollback_rule_version(db: Session, version_id: int) -> tuple[ApprovalRuleVer
 
     affected_order_ids = []
     if old_version_id:
-        affected_order_ids = _cleanup_pending_orders_on_rollback(db, old_version_id)
+        affected_order_ids = _cleanup_pending_orders_on_rollback(db, old_version_id, dry_run=dry_run)
 
-    db.commit()
-    db.refresh(version)
-    return version, affected_order_ids
+    recalculated = []
+    if not dry_run:
+        recalculated = recalculate_pending_orders_route(db)
+
+    if not dry_run:
+        db.commit()
+        db.refresh(version)
+    return version, affected_order_ids, recalculated

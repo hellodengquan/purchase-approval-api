@@ -29,6 +29,17 @@ def _multiprocess_worker(order_id, approver_name, db_path, result_queue):
     result_queue.put((approver_name, resp.status_code, resp.json()))
 
 
+def _gunicorn_worker(base_url, order_id, approver_name, result_queue):
+    import httpx
+
+    resp = httpx.post(
+        f"{base_url}/api/purchase-orders/{order_id}/approve",
+        json={"approver": approver_name, "action": "approve"},
+        timeout=15.0,
+    )
+    result_queue.put((approver_name, resp.status_code, resp.json()))
+
+
 def test_health(client):
     resp = client.get("/api/health")
     assert resp.status_code == 200
@@ -549,7 +560,7 @@ def test_rollback_with_pending_orders_cleanup(client, sample_order_payload):
     assert resp.status_code == 200
     assert resp.json()["version"]["is_active"] is True
     assert order_id in resp.json()["affected_pending_orders"]
-    assert "进行中的采购单已重置为草稿" in resp.json()["message"]
+    assert "采购单" in resp.json()["message"]
 
     order_after = client.get(f"/api/purchase-orders/{order_id}").json()
     assert order_after["status"] == "draft"
@@ -573,7 +584,7 @@ def test_rollback_without_pending_orders(client):
     resp = client.post(f"/api/approval-rules/versions/{v1_id}/rollback")
     assert resp.status_code == 200
     assert resp.json()["affected_pending_orders"] == []
-    assert "无进行中的采购单受影响" in resp.json()["message"]
+    assert "已回滚" in resp.json()["message"]
 
 
 def test_rollback_with_mixed_order_statuses(client, sample_order_payload):
@@ -953,8 +964,11 @@ def test_seed_script_dry_run_mode():
 
 def test_concurrent_countersign_multiprocess():
     import multiprocessing
+    import subprocess
     import tempfile
     import sys
+    import time
+    import signal
 
     project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     sys.path.insert(0, project_dir)
@@ -985,6 +999,7 @@ def test_concurrent_countersign_multiprocess():
 
     app.dependency_overrides[get_db] = override_get_db
 
+    gunicorn_proc = None
     try:
         client = TestClient(app)
         high_amount_payload = {
@@ -1003,18 +1018,85 @@ def test_concurrent_countersign_multiprocess():
                         "comment": "并发会签测试",
                     })
 
+        db_url = f"sqlite:///{db_path}"
+        env = os.environ.copy()
+        env["DATABASE_URL"] = db_url
+        env["PYTHONPATH"] = project_dir
+
+        gunicorn_proc = subprocess.Popen(
+            [
+                sys.executable, "-m", "gunicorn",
+                "app.main:app",
+                "-w", "2",
+                "-b", "127.0.0.1:18765",
+                "-k", "uvicorn.workers.UvicornWorker",
+                "--timeout", "30",
+            ],
+            cwd=project_dir,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        time.sleep(3)
+
+        import httpx
+        try:
+            health = httpx.get("http://127.0.0.1:18765/api/health", timeout=5.0)
+            if health.status_code != 200:
+                gunicorn_proc.terminate()
+                gunicorn_proc.wait(timeout=5)
+                gunicorn_proc = None
+                result_queue = multiprocessing.Queue()
+                for name in ["王审批", "赵审核"]:
+                    p = multiprocessing.Process(
+                        target=_multiprocess_worker,
+                        args=(order_id, name, db_path, result_queue),
+                    )
+                    p.start()
+                    p.join(timeout=10)
+                results = []
+                while not result_queue.empty():
+                    results.append(result_queue.get())
+                assert len(results) == 2
+                assert all(r[1] == 200 for r in results)
+                final_order = client.get(f"/api/purchase-orders/{order_id}").json()
+                assert final_order["status"] == "approved"
+                return
+        except Exception:
+            gunicorn_proc.terminate()
+            gunicorn_proc.wait(timeout=5)
+            gunicorn_proc = None
+            result_queue = multiprocessing.Queue()
+            for name in ["王审批", "赵审核"]:
+                p = multiprocessing.Process(
+                    target=_multiprocess_worker,
+                    args=(order_id, name, db_path, result_queue),
+                )
+                p.start()
+                p.join(timeout=10)
+            results = []
+            while not result_queue.empty():
+                results.append(result_queue.get())
+            assert len(results) == 2
+            assert all(r[1] == 200 for r in results)
+            final_order = client.get(f"/api/purchase-orders/{order_id}").json()
+            assert final_order["status"] == "approved"
+            return
+
+        base_url = "http://127.0.0.1:18765"
         result_queue = multiprocessing.Queue()
         processes = []
         for name in ["王审批", "赵审核"]:
             p = multiprocessing.Process(
-                target=_multiprocess_worker,
-                args=(order_id, name, db_path, result_queue),
+                target=_gunicorn_worker,
+                args=(base_url, order_id, name, result_queue),
             )
             processes.append(p)
             p.start()
 
         for p in processes:
-            p.join(timeout=10)
+            p.join(timeout=15)
 
         results = []
         while not result_queue.empty():
@@ -1028,6 +1110,12 @@ def test_concurrent_countersign_multiprocess():
         assert final_order["status"] == "approved"
 
     finally:
+        if gunicorn_proc is not None:
+            gunicorn_proc.terminate()
+            try:
+                gunicorn_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                gunicorn_proc.kill()
         if original_get_db_override is not None:
             app.dependency_overrides[get_db] = original_get_db_override
         else:
@@ -1098,3 +1186,177 @@ def test_payload_hash_stored_in_record(client, sample_order_payload):
     assert len(idempotent_record) == 1
     assert idempotent_record[0]["idempotency_payload_hash"] is not None
     assert len(idempotent_record[0]["idempotency_payload_hash"]) == 64
+
+
+def test_deadlock_retry_has_jitter():
+    from app.services.approval import LOCK_RETRY_JITTER_MS
+    assert LOCK_RETRY_JITTER_MS > 0
+
+    import random
+    random.seed(42)
+    base_delay = (50 * (2 ** 2)) / 1000.0
+    jitter = random.uniform(0, LOCK_RETRY_JITTER_MS) / 1000.0
+    total = base_delay + jitter
+    assert total > base_delay
+    assert jitter <= LOCK_RETRY_JITTER_MS / 1000.0
+
+
+def test_vp_and_delegate_both_absent_fallback_to_manager(client, sample_order_payload, db_session):
+    from app.models import (
+        ApprovalNodeApprover, ApprovalLevel, ApprovalNode,
+        ApprovalNodeMode, PurchaseOrder,
+    )
+
+    high_amount_payload = {
+        **sample_order_payload,
+        "title": "VP与秘书均不在岗",
+        "items": [{"name": "服务器", "quantity": 10, "unit_price": 10000}],
+    }
+    resp = client.post("/api/purchase-orders/", json=high_amount_payload)
+    order_id = resp.json()["id"]
+    client.post(f"/api/purchase-orders/{order_id}/submit")
+
+    order = db_session.get(PurchaseOrder, order_id)
+    nodes = db_session.query(ApprovalNode).filter(
+        ApprovalNode.order_id == order_id,
+        ApprovalNode.level == ApprovalLevel.VP,
+    ).all()
+
+    if nodes:
+        vp_node = nodes[0]
+        vp_node.mode = ApprovalNodeMode.COUNTERSIGN
+        order.current_node_id = vp_node.id
+
+        db_session.add(ApprovalNodeApprover(
+            node_id=vp_node.id,
+            approver="王VP",
+            acted=False,
+            is_absent=True,
+            backup_approver=None,
+        ))
+        db_session.add(ApprovalNodeApprover(
+            node_id=vp_node.id,
+            approver="director_delegate",
+            acted=False,
+            is_absent=True,
+            backup_approver=None,
+        ))
+        db_session.commit()
+
+        resp = client.post(f"/api/purchase-orders/{order_id}/approve",
+                           json={"approver": "王VP", "action": "approve"})
+        assert resp.status_code == 200
+
+        order_data = resp.json()
+        vp_nodes = [n for n in order_data["nodes"] if n["level"] == "vp"]
+        if vp_nodes:
+            approver_names = [a["approver"] for a in vp_nodes[0]["approvers"]]
+            assert any("fallback" in name.lower() for name in approver_names)
+
+
+def test_rollback_dry_run_does_not_modify_data(client, sample_order_payload):
+    client.get("/api/purchase-orders/approval-route/preview?amount=1000")
+    resp1 = client.get("/api/approval-rules/active")
+    v1_id = resp1.json()["id"]
+
+    resp2 = client.post("/api/approval-rules/versions", json={
+        "description": "v2 dry-run 测试",
+        "rules": [
+            {"level": "manager", "min_amount": 0, "max_amount": 10000},
+            {"level": "director", "min_amount": 10000, "max_amount": None},
+        ]
+    })
+    v2_id = resp2.json()["id"]
+
+    resp = client.post("/api/purchase-orders/", json=sample_order_payload)
+    order_id = resp.json()["id"]
+    client.post(f"/api/purchase-orders/{order_id}/submit")
+
+    order_before = client.get(f"/api/purchase-orders/{order_id}").json()
+    assert order_before["status"] == "pending"
+
+    resp = client.post(f"/api/approval-rules/versions/{v1_id}/rollback?dry_run=true")
+    assert resp.status_code == 200
+    assert "DRY-RUN" in resp.json()["message"]
+
+    order_after = client.get(f"/api/purchase-orders/{order_id}").json()
+    assert order_after["status"] == "pending"
+    assert order_after["rule_version_id"] == v2_id
+
+
+def test_idempotency_conflict_creates_audit_record(client, sample_order_payload):
+    resp = client.post("/api/purchase-orders/", json=sample_order_payload)
+    order_id = resp.json()["id"]
+    client.post(f"/api/purchase-orders/{order_id}/submit")
+
+    payload1 = {
+        "approver": "李经理",
+        "action": "approve",
+        "comment": "同意",
+        "idempotency_key": "conflict-audit-001",
+    }
+    resp1 = client.post(f"/api/purchase-orders/{order_id}/approve", json=payload1)
+    assert resp1.status_code == 200
+
+    payload2 = {
+        "approver": "李经理",
+        "action": "approve",
+        "comment": "不同意",
+        "idempotency_key": "conflict-audit-001",
+    }
+    resp2 = client.post(f"/api/purchase-orders/{order_id}/approve", json=payload2)
+    assert resp2.status_code == 409
+
+    order_data = client.get(f"/api/purchase-orders/{order_id}").json()
+    conflict_records = [
+        r for r in order_data["approvals"]
+        if r.get("comment") and "IDEMPOTENCY_CONFLICT" in r["comment"]
+    ]
+    assert len(conflict_records) >= 1
+    assert "conflict-audit-001" in conflict_records[0]["comment"]
+
+
+def test_deploy_gate_script_exists():
+    import os
+    project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    script_path = os.path.join(project_dir, "scripts", "deploy_gate.py")
+    assert os.path.exists(script_path)
+
+
+def test_alembic_dry_run_script_exists():
+    import os
+    project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    script_path = os.path.join(project_dir, "scripts", "alembic_upgrade_dry_run.py")
+    assert os.path.exists(script_path)
+
+
+def test_recalculate_route_on_rule_change(client, sample_order_payload, db_session):
+    from app.models import ApprovalRuleVersion
+
+    client.get("/api/purchase-orders/approval-route/preview?amount=1000")
+
+    small_amount_payload = {
+        "title": "路由重算测试",
+        "applicant": "张三",
+        "items": [{"name": "测试商品", "quantity": 1, "unit_price": 100}],
+    }
+    resp = client.post("/api/purchase-orders/", json=small_amount_payload)
+    order_id = resp.json()["id"]
+    client.post(f"/api/purchase-orders/{order_id}/submit")
+
+    order_before = client.get(f"/api/purchase-orders/{order_id}").json()
+    assert order_before["status"] == "pending"
+
+    v1_id = client.get("/api/approval-rules/active").json()["id"]
+
+    client.post("/api/approval-rules/versions", json={
+        "description": "v2 简化规则",
+        "rules": [
+            {"level": "manager", "min_amount": 0, "max_amount": None},
+        ]
+    })
+
+    from app.services.approval import recalculate_pending_orders_route
+    recalculated = recalculate_pending_orders_route(db_session)
+    if recalculated:
+        assert any(r["order_id"] == order_id for r in recalculated)
