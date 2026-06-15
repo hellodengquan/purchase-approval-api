@@ -1,0 +1,4 @@
+purchase_approval.db
+*.db
+__pycache__/
+.venv/
